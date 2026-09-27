@@ -32,6 +32,9 @@ from google.genai import types
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 
+from utils import cli_agents
+from utils.cli_agents import is_cli_model
+
 import os
 
 import yaml
@@ -745,6 +748,21 @@ def _to_openrouter_model_id(model_name: str) -> str:
     return model_name
 
 
+async def call_cli_image_generation_with_retry_async(
+    model_name, contents, config, max_attempts=5, retry_delay=30, error_context=""
+):
+    """Generate an image through a logged-in Codex CLI. ``config``: system_prompt, aspect_ratio."""
+    return await cli_agents.call_cli_image_generation_async(
+        model_name,
+        contents,
+        system_prompt=config.get("system_prompt", ""),
+        aspect_ratio=config.get("aspect_ratio"),
+        max_attempts=max_attempts,
+        retry_delay=retry_delay,
+        error_context=error_context,
+    )
+
+
 async def call_model_with_retry_async(
     model_name, contents, config, max_attempts=5, retry_delay=5, error_context=""
 ):
@@ -752,11 +770,24 @@ async def call_model_with_retry_async(
     Unified router that dispatches to the correct provider based on model_name.
 
     Routing rules:
-      1. Explicit prefix overrides: "openrouter/" -> OpenRouter, "claude-" -> Anthropic,
+      1. Explicit prefix overrides: "claude-code[/model]"/"codex[/model]" -> logged-in
+         CLI (no API key), "openrouter/" -> OpenRouter, "claude-" -> Anthropic,
          "gpt-"/"o1-"/"o3-"/"o4-" -> OpenAI
       2. No prefix: auto-detect based on which API key is configured.
          Priority: OpenRouter > Gemini > Anthropic > OpenAI
     """
+    # Logged-in coding-agent CLIs (Claude Code / Codex) need no API key.
+    if is_cli_model(model_name):
+        return await cli_agents.call_cli_agent_async(
+            model_name,
+            contents,
+            system_prompt=getattr(config, "system_instruction", None) or "",
+            candidate_num=getattr(config, "candidate_count", None) or 1,
+            max_attempts=max_attempts,
+            retry_delay=retry_delay,
+            error_context=error_context,
+        )
+
     # Explicit provider prefix overrides auto-detection
     if model_name.startswith("openrouter/"):
         provider = "openrouter"

@@ -93,7 +93,15 @@ class VanillaAgent(BaseAgent):
         image_size = image_size_from_data(data)
 
         if cfg["use_image_generation"]:
-            if "gpt-image" in self.model_name:
+            if generation_utils.is_cli_model(self.model_name):
+                response_list = await generation_utils.call_cli_image_generation_with_retry_async(
+                    model_name=self.model_name,
+                    contents=content_list,
+                    config={"system_prompt": self.system_prompt, "aspect_ratio": aspect_ratio},
+                    max_attempts=5,
+                    retry_delay=30,
+                )
+            elif "gpt-image" in self.model_name:
                 image_config = {
                     "size": "1536x1024",
                     "quality": "high",
