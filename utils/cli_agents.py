@@ -6,9 +6,12 @@ Claude Code / Codex subscription login is used and no API key is needed.
 Standard library only.
 """
 
+import asyncio
 import base64
+import json
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 # backend -> (binary override env var, default binary, API-key env vars to strip)
@@ -129,3 +132,125 @@ def build_command(backend, model, *, system_prompt, image_paths, workdir, output
         cmd += ["-m", model]
     cmd.append("-")  # prompt on stdin
     return cmd
+
+
+DEFAULT_TIMEOUT = 900  # seconds; Codex image generation takes ~1 minute
+
+
+def _subprocess_env(backend):
+    stripped = BACKENDS[backend][2]
+    return {k: v for k, v in os.environ.items() if k not in stripped}
+
+
+async def _run(cmd, prompt, *, cwd, env, timeout):
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, cwd=cwd, env=env,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(prompt.encode()), timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise CLIAgentError(f"timed out after {timeout}s")
+    if proc.returncode != 0:
+        raise CLIAgentError(f"exited with {proc.returncode}: {stderr.decode(errors='replace')[-800:].strip()}")
+    return stdout.decode(errors="replace")
+
+
+def _parse_text(backend, stdout, output_file):
+    if backend == "claude-code":
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            raise CLIAgentError(f"unexpected output: {stdout[:300]!r}")
+        if payload.get("is_error"):
+            raise CLIAgentError(f"reported an error: {payload.get('result')!r}")
+        text = payload.get("result") or ""
+    else:
+        text = output_file.read_text() if output_file.exists() else ""
+    if not text.strip():
+        raise CLIAgentError("returned an empty response")
+    return text.strip()
+
+
+def _read_image(path):
+    if not path.exists():
+        raise CLIAgentError(f"did not produce {path.name}")
+    data = path.read_bytes()
+    if not (data.startswith(b"\x89PNG\r\n\x1a\n") or data.startswith(b"\xff\xd8\xff")):
+        raise CLIAgentError(f"{path.name} is not a PNG or JPEG image")
+    return base64.b64encode(data).decode()
+
+
+async def _call_once(backend, model, contents, system_prompt, timeout, generate_image=False, aspect_ratio=None):
+    with tempfile.TemporaryDirectory(prefix="paperbanana-cli-") as tmp:
+        workdir = Path(tmp).resolve()
+        text, image_paths = materialize_contents(contents, workdir)
+        output_file = workdir / "last_message.txt"
+        cmd = build_command(
+            backend, model, system_prompt=system_prompt, image_paths=image_paths,
+            workdir=workdir, output_file=output_file, generate_image=generate_image,
+        )
+        prompt = compose_prompt(
+            backend, text, image_paths, system_prompt,
+            generate_image=generate_image, aspect_ratio=aspect_ratio,
+        )
+        stdout = await _run(cmd, prompt, cwd=workdir, env=_subprocess_env(backend), timeout=timeout)
+        if generate_image:
+            return _read_image(workdir / IMAGE_OUTPUT_NAME)
+        return _parse_text(backend, stdout, output_file)
+
+
+async def _with_retry(attempt_fn, max_attempts, retry_delay, label):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await attempt_fn()
+        except CLIAgentUnavailable:
+            raise
+        except CLIAgentError as e:
+            print(f"[CLI agent] {label} attempt {attempt}/{max_attempts} failed: {e}")
+            if attempt < max_attempts:
+                await asyncio.sleep(retry_delay)
+    return None
+
+
+def _require(model_name):
+    parsed = parse_cli_model(model_name)
+    if parsed is None:
+        raise ValueError(f"{model_name!r} is not a CLI agent model name")
+    return parsed
+
+
+async def call_cli_agent_async(
+    model_name, contents, system_prompt="", *, candidate_num=1,
+    max_attempts=3, retry_delay=5, timeout=DEFAULT_TIMEOUT, error_context="",
+):
+    """Text generation through the CLI. Returns ``candidate_num`` strings; ``"Error"`` for failures."""
+    backend, model = _require(model_name)
+    label = f"{model_name} {error_context}".strip()
+
+    async def one_candidate():
+        result = await _with_retry(
+            lambda: _call_once(backend, model, contents, system_prompt, timeout),
+            max_attempts, retry_delay, label,
+        )
+        return result if result is not None else "Error"
+
+    return list(await asyncio.gather(*(one_candidate() for _ in range(max(1, candidate_num or 1)))))
+
+
+async def call_cli_image_generation_async(
+    model_name, contents, system_prompt="", *, aspect_ratio=None,
+    max_attempts=3, retry_delay=5, timeout=DEFAULT_TIMEOUT, error_context="",
+):
+    """Image generation through the CLI. Returns ``[base64_image]`` or ``["Error"]``."""
+    backend, model = _require(model_name)
+    result = await _with_retry(
+        lambda: _call_once(
+            backend, model, contents, system_prompt, timeout,
+            generate_image=True, aspect_ratio=aspect_ratio,
+        ),
+        max_attempts, retry_delay, f"{model_name} image {error_context}".strip(),
+    )
+    return [result if result is not None else "Error"]

@@ -116,5 +116,191 @@ class BuildCommandTests(unittest.TestCase):
                 cli_agents.resolve_binary("claude-code")
 
 
+import asyncio
+import json
+import stat
+import time
+
+FAKE_CLI = r'''#!/usr/bin/env python3
+import json, os, sys, time
+from pathlib import Path
+args = sys.argv[1:]
+stdin = sys.stdin.read()
+record_path = os.environ["FAKE_CLI_RECORD"]
+with open(record_path, "a") as f:
+    f.write(json.dumps({
+        "args": args, "stdin": stdin, "cwd": os.getcwd(),
+        "existing": [p for p in args + stdin.split() if os.path.isfile(p)],
+        "env": {k: os.environ.get(k) for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY")},
+    }) + "\n")
+calls = len(open(record_path).read().splitlines())
+mode = os.environ.get("FAKE_CLI_MODE", "ok")
+text = os.environ.get("FAKE_CLI_TEXT", "fake answer")
+if mode == "fail" or (mode == "fail_once" and calls == 1):
+    sys.stderr.write("boom")
+    sys.exit(2)
+if mode == "sleep":
+    time.sleep(5)
+if args[0] == "exec":
+    workdir = Path(args[args.index("-C") + 1])
+    Path(args[args.index("-o") + 1]).write_text(text)
+    image = {"image": PNG_BYTES, "jpeg": JPEG_BYTES, "badimage": b"not an image"}.get(mode)
+    if image is not None:
+        (workdir / "output.png").write_bytes(image)
+elif mode == "garbage":
+    print("Update available! Run brew upgrade.")
+else:
+    print(json.dumps({"type": "result", "result": text, "is_error": mode == "is_error"}))
+'''.replace("PNG_BYTES", repr(PNG)).replace("JPEG_BYTES", repr(JPEG))
+
+TEXT_CONTENTS = [{"type": "text", "text": "Plan the figure."}]
+
+
+class FakeCLITests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        script = Path(self.tmp.name) / "fake_cli"
+        script.write_text(FAKE_CLI)
+        script.chmod(script.stat().st_mode | stat.S_IEXEC)
+        self.record = Path(self.tmp.name) / "record.jsonl"
+        patcher = mock.patch.dict(os.environ, {
+            "PAPERBANANA_CLAUDE_BIN": str(script),
+            "PAPERBANANA_CODEX_BIN": str(script),
+            "FAKE_CLI_RECORD": str(self.record),
+            "ANTHROPIC_API_KEY": "sk-ant-secret",
+            "OPENAI_API_KEY": "sk-openai-secret",
+            "CODEX_API_KEY": "codex-secret",
+        })
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def mode(self, mode, text=None):
+        env = {"FAKE_CLI_MODE": mode}
+        if text is not None:
+            env["FAKE_CLI_TEXT"] = text
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def calls(self):
+        if not self.record.exists():
+            return []
+        return [json.loads(line) for line in self.record.read_text().splitlines()]
+
+    def text(self, model, contents=TEXT_CONTENTS, **kw):
+        kw.setdefault("retry_delay", 0)
+        return asyncio.run(cli_agents.call_cli_agent_async(model, contents, **kw))
+
+    def image(self, model, contents=TEXT_CONTENTS, **kw):
+        kw.setdefault("retry_delay", 0)
+        return asyncio.run(cli_agents.call_cli_image_generation_async(model, contents, **kw))
+
+    def test_claude_text_uses_stdin_and_strips_its_api_key(self):
+        self.mode("ok", "the plan")
+        self.assertEqual(self.text("claude-code/sonnet", system_prompt="SYS"), ["the plan"])
+        call = self.calls()[0]
+        self.assertIn("Plan the figure.", call["stdin"])
+        self.assertIsNone(call["env"]["ANTHROPIC_API_KEY"])
+        self.assertEqual(call["args"][call["args"].index("--system-prompt") + 1], "SYS")
+
+    def test_candidates_run_as_separate_calls(self):
+        self.mode("ok", "x")
+        self.assertEqual(self.text("claude-code", candidate_num=3), ["x", "x", "x"])
+        self.assertEqual(len(self.calls()), 3)
+
+    def test_codex_text_reads_last_message_and_strips_openai_keys(self):
+        self.mode("ok", "codex plan")
+        self.assertEqual(self.text("codex", system_prompt="Be a stylist."), ["codex plan"])
+        call = self.calls()[0]
+        self.assertIn("Be a stylist.", call["stdin"])
+        self.assertIsNone(call["env"]["OPENAI_API_KEY"])
+        self.assertIsNone(call["env"]["CODEX_API_KEY"])
+
+    def test_claude_reads_image_files_that_are_removed_afterwards(self):
+        self.mode("ok", "critique")
+        contents = TEXT_CONTENTS + [{"type": "image", "image_base64": base64.b64encode(JPEG).decode()}]
+        self.assertEqual(self.text("claude-code", contents), ["critique"])
+        call = self.calls()[0]
+        self.assertEqual(len(call["existing"]), 1)
+        self.assertEqual(call["args"][call["args"].index("--add-dir") + 1], call["cwd"])
+        self.assertFalse(Path(call["existing"][0]).exists())
+
+    def test_persistent_failure_returns_error_per_candidate(self):
+        self.mode("fail")
+        self.assertEqual(self.text("claude-code", candidate_num=2, max_attempts=2), ["Error", "Error"])
+        self.assertEqual(len(self.calls()), 4)
+
+    def test_transient_failure_is_retried(self):
+        self.mode("fail_once", "second try")
+        self.assertEqual(self.text("codex", max_attempts=3), ["second try"])
+        self.assertEqual(len(self.calls()), 2)
+
+    def test_is_error_and_garbage_output_become_error(self):
+        for mode in ("is_error", "garbage"):
+            with self.subTest(mode=mode):
+                self.mode(mode)
+                self.assertEqual(self.text("claude-code", max_attempts=1), ["Error"])
+
+    def test_timeout_becomes_error(self):
+        self.mode("sleep")
+        start = time.monotonic()
+        self.assertEqual(self.text("claude-code", max_attempts=1, timeout=0.5), ["Error"])
+        self.assertLess(time.monotonic() - start, 4)
+
+    def test_missing_binary_raises_without_retry(self):
+        with mock.patch.dict(os.environ, {"PAPERBANANA_CODEX_BIN": "/nonexistent/codex"}):
+            with self.assertRaises(CLIAgentUnavailable):
+                self.text("codex", max_attempts=5)
+
+    def test_large_prompt_arrives_intact(self):
+        self.mode("ok")
+        big = "r" * 1_000_000
+        self.text("claude-code", [{"type": "text", "text": big}])
+        self.assertIn(big, self.calls()[0]["stdin"])
+
+    def test_codex_generates_png_and_jpeg(self):
+        for mode, payload in (("image", PNG), ("jpeg", JPEG)):
+            with self.subTest(mode=mode):
+                self.mode(mode)
+                result = self.image("codex", system_prompt="Illustrator.", aspect_ratio="16:9")
+                self.assertEqual(base64.b64decode(result[0]), payload)
+        call = self.calls()[-1]
+        self.assertEqual(call["args"][call["args"].index("-s") + 1], "workspace-write")
+        self.assertIn("16:9", call["stdin"])
+
+    def test_invalid_or_missing_image_becomes_error(self):
+        for mode in ("badimage", "ok"):
+            with self.subTest(mode=mode):
+                self.mode(mode)
+                self.assertEqual(self.image("codex", max_attempts=1), ["Error"])
+
+    def test_image_editing_passes_input_image(self):
+        self.mode("image")
+        contents = TEXT_CONTENTS + [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(JPEG).decode()}}]
+        self.image("codex", contents)
+        call = self.calls()[0]
+        self.assertEqual(call["args"][0:2], ["exec", "-i"])
+        self.assertEqual(len(call["existing"]), 1)
+
+    def test_concurrent_image_calls_are_isolated(self):
+        self.mode("image")
+
+        async def run_many():
+            return await asyncio.gather(*(
+                cli_agents.call_cli_image_generation_async("codex", TEXT_CONTENTS, retry_delay=0) for _ in range(5)
+            ))
+
+        results = asyncio.run(run_many())
+        self.assertEqual([r[0] for r in results], [base64.b64encode(PNG).decode()] * 5)
+        workdirs = {c["cwd"] for c in self.calls()}
+        self.assertEqual(len(workdirs), 5)
+        self.assertFalse(any(Path(w).exists() for w in workdirs))
+
+    def test_claude_image_generation_is_unavailable(self):
+        with self.assertRaises(CLIAgentUnavailable):
+            self.image("claude-code")
+        self.assertEqual(self.calls(), [])
+
 if __name__ == "__main__":
     unittest.main()
