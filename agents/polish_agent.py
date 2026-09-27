@@ -166,7 +166,15 @@ class PolishAgent(BaseAgent):
         aspect_ratio = data.get("additional_info", {}).get("rounded_ratio", "16:9")
         image_size = image_size_from_data(data)
         try:
-            if generation_utils.openrouter_client is not None:
+            if generation_utils.is_cli_model(self.image_gen_model_name):
+                response_list = await generation_utils.call_cli_image_generation_with_retry_async(
+                    model_name=self.image_gen_model_name,
+                    contents=content_list,
+                    config={"system_prompt": self.system_prompt, "aspect_ratio": aspect_ratio},
+                    max_attempts=5,
+                    retry_delay=30,
+                )
+            elif generation_utils.openrouter_client is not None:
                 image_config = {
                     "system_prompt": self.system_prompt,
                     "temperature": self.exp_config.temperature,
