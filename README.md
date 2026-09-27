@@ -59,6 +59,23 @@ We recommend duplicate the `configs/model_config.template.yaml` file into `confi
 
 Note that if you need to generate many candidates simultaneously, you will require an API key that supports high concurrency.
 
+#### No API key? Use Claude Code or Codex instead
+
+If you have [Claude Code](https://docs.claude.com/en/docs/claude-code) or [Codex CLI](https://github.com/openai/codex) installed and logged in (`claude` then `/login`, or `codex login`), PaperBanana can run every agent through that CLI and your subscription, with no provider API key. Select it by model name:
+
+```yaml
+defaults:
+  main_model_name: "claude-code/sonnet"   # or "claude-code", "codex", "codex/<model>"
+  image_gen_model_name: "codex"           # Codex's built-in image generation
+```
+
+- `claude-code[/<model>]` runs `claude -p`; `codex[/<model>]` runs `codex exec`. The part after `/` is passed as the CLI's `--model`; without it the CLI's default model is used.
+- Claude Code cannot generate images, so set `image_gen_model_name` to `codex` for diagrams, or keep an image API model. Plot mode (matplotlib code) works with either CLI.
+- For these calls the bridge removes `ANTHROPIC_API_KEY` (Claude) and `OPENAI_API_KEY`/`CODEX_API_KEY` (Codex) from the subprocess environment, so your subscription login is used even if a key is set. Usage counts against your subscription limits.
+- If the binaries aren't on `PATH`, set `PAPERBANANA_CLAUDE_BIN` / `PAPERBANANA_CODEX_BIN`.
+- Each call is a separate headless CLI session, so it is slower than a direct API call. Keep the number of parallel candidates modest.
+- Smoke test against the real CLIs: `PAPERBANANA_LIVE_CLI=1 python -m unittest tests.test_cli_agents_live`.
+
 ### Step3: Downloading the Dataset
 First download [PaperBananaBench](https://huggingface.co/datasets/dwzhu/PaperBananaBench), then place it under the `data` directory (e.g., `data/PaperBananaBench/`). The framework is designed to function gracefully without the dataset by bypassing the Retriever Agent's few-shot learning capability. If interested in the original PDFs, please download them from [PaperBananaDiagramPDFs](https://huggingface.co/datasets/dwzhu/PaperBananaDiagramPDFs).
 

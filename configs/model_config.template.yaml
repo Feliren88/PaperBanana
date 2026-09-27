@@ -18,6 +18,9 @@
 defaults:
   main_model_name: "gemini-3.1-pro-preview"
   image_gen_model_name: "gemini-3.1-flash-image-preview"
+  # No API key? Use your logged-in coding-agent CLI instead:
+  #   main_model_name: "claude-code/sonnet"   # or "claude-code", "codex", "codex/<model>"
+  #   image_gen_model_name: "codex"           # Codex's built-in image generation (Claude Code cannot make images)
   
 # API Keys. If you are using all gemini models, you can leave the other keys empty.
 api_keys:
