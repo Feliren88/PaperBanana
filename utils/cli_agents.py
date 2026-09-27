@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import shutil
+import signal
 import tempfile
 from pathlib import Path
 
@@ -73,6 +74,7 @@ def materialize_contents(contents, workdir):
             path = Path(workdir) / f"input_{len(image_paths) + 1}{_IMAGE_SUFFIXES.get(media_type, '.jpg')}"
             path.write_bytes(base64.b64decode(data))
             image_paths.append(path)
+            texts.append(f"[Image: {path.name}]")
     return "\n\n".join(texts), image_paths
 
 
@@ -86,6 +88,8 @@ def compose_prompt(backend, text, image_paths, system_prompt, *, generate_image=
             "Input images (open each with the Read tool before answering):\n"
             + "\n".join(str(p) for p in image_paths)
         )
+    if backend == "codex" and image_paths:
+        parts.append("The attached images, in order: " + ", ".join(p.name for p in image_paths) + ".")
     parts.append(text)
     if generate_image:
         ratio = f" with aspect ratio {aspect_ratio}" if aspect_ratio else ""
@@ -142,19 +146,41 @@ def _subprocess_env(backend):
     return {k: v for k, v in os.environ.items() if k not in stripped}
 
 
+def _kill(proc):
+    """Kill the CLI and anything it spawned (it runs in its own process group)."""
+    if proc.returncode is not None:
+        return
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except ProcessLookupError:
+        pass
+
+
 async def _run(cmd, prompt, *, cwd, env, timeout):
     proc = await asyncio.create_subprocess_exec(
-        *cmd, cwd=cwd, env=env,
+        *cmd, cwd=cwd, env=env, start_new_session=True,
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(prompt.encode()), timeout)
     except asyncio.TimeoutError:
-        proc.kill()
+        _kill(proc)
         await proc.wait()
         raise CLIAgentError(f"timed out after {timeout}s")
+    except BaseException:
+        # Cancelled (e.g. a sibling candidate failed): never leave the CLI running.
+        _kill(proc)
+        await proc.wait()
+        raise
     if proc.returncode != 0:
-        raise CLIAgentError(f"exited with {proc.returncode}: {stderr.decode(errors='replace')[-800:].strip()}")
+        # claude -p reports failures such as "Not logged in" as JSON on stdout.
+        detail = "\n".join(
+            b.decode(errors="replace").strip() for b in (stderr, stdout) if b.strip()
+        )
+        raise CLIAgentError(f"exited with {proc.returncode}: {detail[-800:]}")
     return stdout.decode(errors="replace")
 
 
@@ -164,11 +190,15 @@ def _parse_text(backend, stdout, output_file):
             payload = json.loads(stdout)
         except json.JSONDecodeError:
             raise CLIAgentError(f"unexpected output: {stdout[:300]!r}")
+        if not isinstance(payload, dict):
+            raise CLIAgentError(f"unexpected output: {stdout[:300]!r}")
         if payload.get("is_error"):
             raise CLIAgentError(f"reported an error: {payload.get('result')!r}")
         text = payload.get("result") or ""
+        if not isinstance(text, str):
+            raise CLIAgentError(f"unexpected result: {text!r}")
     else:
-        text = output_file.read_text() if output_file.exists() else ""
+        text = output_file.read_text(encoding="utf-8", errors="replace") if output_file.exists() else ""
     if not text.strip():
         raise CLIAgentError("returned an empty response")
     return text.strip()
@@ -208,7 +238,7 @@ async def _with_retry(attempt_fn, max_attempts, retry_delay, label):
             return await attempt_fn()
         except CLIAgentUnavailable:
             raise
-        except CLIAgentError as e:
+        except Exception as e:  # any per-call failure keeps the providers' "Error" contract
             print(f"[CLI agent] {label} attempt {attempt}/{max_attempts} failed: {e}")
             if attempt < max_attempts:
                 await asyncio.sleep(retry_delay)

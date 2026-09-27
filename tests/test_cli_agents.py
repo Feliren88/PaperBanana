@@ -39,7 +39,7 @@ class MaterializeTests(unittest.TestCase):
                 ],
                 Path(tmp),
             )
-            self.assertEqual(text, "first\n\nsecond")
+            self.assertEqual(text, "first\n\n[Image: input_1.png]\n\n[Image: input_2.jpg]\n\nsecond")
             self.assertEqual([p.name for p in paths], ["input_1.png", "input_2.jpg"])
             self.assertEqual(paths[0].read_bytes(), PNG)
             self.assertEqual(paths[1].read_bytes(), JPEG)
@@ -57,6 +57,10 @@ class ComposePromptTests(unittest.TestCase):
         prompt = cli_agents.compose_prompt("claude-code", "Critique.", [Path("/w/input_1.jpg")], "")
         self.assertIn("/w/input_1.jpg", prompt)
         self.assertIn("Read tool", prompt)
+
+    def test_codex_names_attached_images_in_order(self):
+        prompt = cli_agents.compose_prompt("codex", "Compare.", [Path("/w/input_1.png"), Path("/w/input_2.jpg")], "")
+        self.assertIn("attached images, in order: input_1.png, input_2.jpg", prompt)
 
     def test_image_generation_prompt_names_output_file_and_ratio(self):
         prompt = cli_agents.compose_prompt("codex", "Draw it.", [], "", generate_image=True, aspect_ratio="16:9")
@@ -132,10 +136,14 @@ with open(record_path, "a") as f:
         "args": args, "stdin": stdin, "cwd": os.getcwd(),
         "existing": [p for p in args + stdin.split() if os.path.isfile(p)],
         "env": {k: os.environ.get(k) for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY")},
+        "pid": os.getpid(),
     }) + "\n")
 calls = len(open(record_path).read().splitlines())
 mode = os.environ.get("FAKE_CLI_MODE", "ok")
 text = os.environ.get("FAKE_CLI_TEXT", "fake answer")
+if mode == "fail_json":
+    print(json.dumps({"type": "result", "result": "Not logged in. Please run /login", "is_error": True}))
+    sys.exit(1)
 if mode == "fail" or (mode == "fail_once" and calls == 1):
     sys.stderr.write("boom")
     sys.exit(2)
@@ -143,10 +151,14 @@ if mode == "sleep":
     time.sleep(5)
 if args[0] == "exec":
     workdir = Path(args[args.index("-C") + 1])
-    Path(args[args.index("-o") + 1]).write_text(text)
+    Path(args[args.index("-o") + 1]).write_bytes(b"caf\xe9 latin-1" if mode == "latin1" else text.encode("utf-8"))
     image = {"image": PNG_BYTES, "jpeg": JPEG_BYTES, "badimage": b"not an image"}.get(mode)
     if image is not None:
         (workdir / "output.png").write_bytes(image)
+elif mode == "json_list":
+    print("[]")
+elif mode == "nonstring":
+    print(json.dumps({"result": 5, "is_error": False}))
 elif mode == "garbage":
     print("Update available! Run brew upgrade.")
 else:
@@ -296,6 +308,44 @@ class FakeCLITests(unittest.TestCase):
         workdirs = {c["cwd"] for c in self.calls()}
         self.assertEqual(len(workdirs), 5)
         self.assertFalse(any(Path(w).exists() for w in workdirs))
+
+    def test_unexpected_json_shapes_become_error(self):
+        for mode in ("json_list", "nonstring"):
+            with self.subTest(mode=mode):
+                self.mode(mode)
+                self.assertEqual(self.text("claude-code", max_attempts=1), ["Error"])
+
+    def test_codex_non_utf8_output_is_decoded_not_raised(self):
+        self.mode("latin1")
+        [answer] = self.text("codex", max_attempts=1)
+        self.assertTrue(answer.startswith("caf"))
+        self.assertNotEqual(answer, "Error")
+
+    def test_nonzero_exit_reports_cli_json_error_message(self):
+        import contextlib, io
+        self.mode("fail_json")
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            self.assertEqual(self.text("claude-code", max_attempts=1), ["Error"])
+        self.assertIn("Not logged in", log.getvalue())
+
+    def test_cancellation_kills_the_cli_process(self):
+        self.mode("sleep")
+
+        async def start_then_cancel():
+            task = asyncio.ensure_future(cli_agents.call_cli_agent_async("claude-code", TEXT_CONTENTS, retry_delay=0))
+            for _ in range(200):
+                if self.calls():
+                    break
+                await asyncio.sleep(0.02)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(start_then_cancel())
+        pid = self.calls()[0]["pid"]
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
 
     def test_claude_image_generation_is_unavailable(self):
         with self.assertRaises(CLIAgentUnavailable):

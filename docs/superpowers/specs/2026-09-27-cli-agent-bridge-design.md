@@ -56,7 +56,7 @@ still goes to the Anthropic API).
     --system-prompt <sp> [--model m]`; with images: `--tools Read
     --allowedTools Read --add-dir <workdir>` and the prompt lists the image
     paths to read; without images: `--tools ""`. Image generation → raises
-    `CLIAgentError` (unsupported).
+    `CLIAgentUnavailable` (unsupported; not retried).
   - Codex: `codex exec --skip-git-repo-check --ephemeral -C <workdir>
     -o <output_file> [-m m] [-i img ...] -`; sandbox `read-only` for text,
     `workspace-write` for image generation. Codex has no system-prompt flag, so
